@@ -9,9 +9,10 @@ namespace SourceGenerators.EF.Generators;
 
 /// <summary>
 /// For every DbContext marked with <c>[GenerateEntities("schema.json")]</c>, reads the JSON
-/// schema (which must be an AdditionalFile) and emits one entity class per definition plus
-/// DbSet properties on the context. Entities with "extends" enrich an existing partial class
-/// instead of declaring a new one.
+/// schema (which must be an AdditionalFile) and emits one entity class per definition, a
+/// Fluent API configuration for it, and DbSet properties plus ApplyGeneratedConfiguration on
+/// the context. Entities with "extends" enrich an existing partial class instead of declaring
+/// a new one.
 /// </summary>
 [Generator]
 public sealed class EntityGenerator : IIncrementalGenerator
@@ -87,6 +88,14 @@ public sealed class EntityGenerator : IIncrementalGenerator
 		DiagnosticSeverity.Error,
 		isEnabledByDefault: true);
 
+	private static readonly DiagnosticDescriptor RelationalNotReferenced = new(
+		id: "EFGEN007",
+		title: "Relational EF Core not referenced",
+		messageFormat: "Entity '{0}' sets \"table\", which requires Microsoft.EntityFrameworkCore.Relational (normally brought in by a database provider package)",
+		category: "EntityGenerator",
+		DiagnosticSeverity.Error,
+		isEnabledByDefault: true);
+
 	/// <summary>Location data that survives incremental caching (Location itself holds a SyntaxTree reference).</summary>
 	private sealed record LocationInfo(string Path, TextSpan Span, LinePositionSpan LineSpan)
 	{
@@ -107,7 +116,9 @@ public sealed class EntityGenerator : IIncrementalGenerator
 	private sealed record TypeFacts(string MetadataName, bool Found, string? Namespace, string Name, bool IsPartial, EquatableArray<string> InstanceMembers);
 
 	/// <summary>Everything the emit step needs; equatable so emission is skipped when nothing relevant changed.</summary>
-	private sealed record EmitInput(ResolvedTarget Target, EquatableArray<TypeFacts> Types);
+	private sealed record EmitInput(ResolvedTarget Target, EquatableArray<TypeFacts> Types, bool HasRelational);
+
+	private const string RelationalExtensionsName = "Microsoft.EntityFrameworkCore.RelationalEntityTypeBuilderExtensions";
 
 	// Types that are reference types in C# and therefore need `= null!` when non-nullable.
 	private static readonly HashSet<string> ReferenceTypes = new(StringComparer.Ordinal)
@@ -141,7 +152,10 @@ public sealed class EntityGenerator : IIncrementalGenerator
 		// context, or one of the referenced types actually changed.
 		var emitInputs = resolved
 			.Combine(context.CompilationProvider)
-			.Select(static (pair, ct) => new EmitInput(pair.Left, CollectTypeFacts(pair.Left, pair.Right, ct)));
+			.Select(static (pair, ct) => new EmitInput(
+				pair.Left,
+				CollectTypeFacts(pair.Left, pair.Right, ct),
+				HasRelational: pair.Right.GetTypeByMetadataName(RelationalExtensionsName) is not null));
 
 		context.RegisterSourceOutput(emitInputs, static (spc, input) => Emit(spc, input));
 	}
@@ -263,6 +277,18 @@ public sealed class EntityGenerator : IIncrementalGenerator
 			spc.ReportDiagnostic(Diagnostic.Create(ContextNotPartial, attrLocation, ctx.Name));
 			return;
 		}
+		// Emitted even when the schema is broken, so the user's call to ApplyGeneratedConfiguration
+		// keeps compiling and the only errors shown are the schema ones.
+		var configurations = new List<string>();
+		EmitEntities(spc, input, attrLocation, configurations);
+		spc.AddSource($"{ctx.Name}.Configuration.g.cs", SourceText.From(EmitApplyConfiguration(ctx, configurations), Encoding.UTF8));
+	}
+
+	private static void EmitEntities(SourceProductionContext spc, EmitInput input, Location attrLocation, List<string> configurations)
+	{
+		var target = input.Target;
+		var ctx = target.Context;
+
 		if (target.SchemaText is null || target.SchemaFilePath is null)
 		{
 			spc.ReportDiagnostic(Diagnostic.Create(SchemaNotFound, attrLocation, ctx.SchemaPath));
@@ -288,6 +314,7 @@ public sealed class EntityGenerator : IIncrementalGenerator
 		foreach (var entity in schema.Entities)
 		{
 			string fullName;
+			string? ns;
 			if (entity.IsExtension)
 			{
 				var facts = types[entity.Extends!];
@@ -305,6 +332,7 @@ public sealed class EntityGenerator : IIncrementalGenerator
 				ReportClashes(spc, entity, facts, target.SchemaFilePath, schemaText);
 				spc.AddSource($"{ctx.Name}.{entity.Name}.g.cs", SourceText.From(EmitExtension(facts, entity), Encoding.UTF8));
 				fullName = facts.MetadataName;
+				ns = facts.Namespace;
 			}
 			else
 			{
@@ -315,6 +343,20 @@ public sealed class EntityGenerator : IIncrementalGenerator
 
 				spc.AddSource($"{ctx.Name}.{entity.Name}.g.cs", SourceText.From(EmitEntity(entityNamespace, baseType, entity), Encoding.UTF8));
 				fullName = $"{entityNamespace}.{entity.Name}";
+				ns = entityNamespace;
+			}
+
+			// Only entities with something to configure get a configuration, since applying one
+			// also adds the entity to the model.
+			if (entity.Table is not null && !input.HasRelational)
+			{
+				spc.ReportDiagnostic(Diagnostic.Create(RelationalNotReferenced, attrLocation, entity.Name));
+			}
+			else if (entity.Table is not null || entity.Properties.Any(p => p.Key || p.Required || p.MaxLength is not null))
+			{
+				var configNamespace = ns is null ? "Configuration" : ns + ".Configuration";
+				spc.AddSource($"{ctx.Name}.{entity.Name}Configuration.g.cs", SourceText.From(EmitConfiguration(configNamespace, fullName, entity), Encoding.UTF8));
+				configurations.Add($"{configNamespace}.{entity.Name}Configuration");
 			}
 
 			if (entity.WantsDbSet)
@@ -360,8 +402,6 @@ public sealed class EntityGenerator : IIncrementalGenerator
 	{
 		var sb = new StringBuilder();
 		AppendHeader(sb, entityNamespace);
-		if (entity.Table is not null)
-			sb.AppendLine($"[Table(\"{entity.Table}\")]");
 		var inherits = baseType is null ? "" : $" : global::{baseType}";
 		sb.AppendLine($"public partial class {entity.Name}{inherits}");
 		sb.AppendLine("{");
@@ -390,8 +430,6 @@ public sealed class EntityGenerator : IIncrementalGenerator
 	{
 		sb.AppendLine("// <auto-generated/>");
 		sb.AppendLine("#nullable enable");
-		sb.AppendLine("using System.ComponentModel.DataAnnotations;");
-		sb.AppendLine("using System.ComponentModel.DataAnnotations.Schema;");
 		sb.AppendLine();
 		if (ns is not null) sb.AppendLine($"namespace {ns};").AppendLine();
 	}
@@ -400,10 +438,6 @@ public sealed class EntityGenerator : IIncrementalGenerator
 	{
 		foreach (var p in entity.Properties)
 		{
-			if (p.Key) sb.AppendLine("    [Key]");
-			if (p.Required) sb.AppendLine("    [Required]");
-			if (p.MaxLength is int max) sb.AppendLine($"    [MaxLength({max})]");
-
 			var isRef = ReferenceTypes.Contains(p.Type);
 			var type = p.Nullable ? p.Type + "?" : p.Type;
 			// Non-nullable reference types get `= null!` so the compiler doesn't warn about
@@ -411,6 +445,73 @@ public sealed class EntityGenerator : IIncrementalGenerator
 			var init = !p.Nullable && isRef ? " = null!;" : "";
 			sb.AppendLine($"    public {type} {p.Name} {{ get; set; }}{init}");
 		}
+	}
+
+	/// <summary>
+	/// Fluent configuration for one entity. Internal because the entity may be (an extended
+	/// type keeps its hand-written accessibility), and a public class could not expose it.
+	/// </summary>
+	private static string EmitConfiguration(string configNamespace, string entityFullName, EntityModel entity)
+	{
+		var sb = new StringBuilder();
+		sb.AppendLine("// <auto-generated/>");
+		sb.AppendLine("#nullable enable");
+		sb.AppendLine("using Microsoft.EntityFrameworkCore; // fluent extension methods (HasMaxLength, ToTable, ...)");
+		sb.AppendLine();
+		sb.AppendLine($"namespace {configNamespace};").AppendLine();
+		// Lets ApplyConfigurationsFromAssembly skip generated configurations when they are
+		// applied separately through ApplyGeneratedConfiguration.
+		sb.AppendLine($"[global::System.CodeDom.Compiler.GeneratedCode(\"{typeof(EntityGenerator).FullName}\", \"{typeof(EntityGenerator).Assembly.GetName().Version}\")]");
+		sb.AppendLine($"internal sealed class {entity.Name}Configuration : global::Microsoft.EntityFrameworkCore.IEntityTypeConfiguration<global::{entityFullName}>");
+		sb.AppendLine("{");
+		sb.AppendLine($"    public void Configure(global::Microsoft.EntityFrameworkCore.Metadata.Builders.EntityTypeBuilder<global::{entityFullName}> builder)");
+		sb.AppendLine("    {");
+
+		if (entity.Table is not null)
+			sb.AppendLine($"        builder.ToTable(\"{entity.Table}\");");
+
+		var keys = entity.Properties.Where(p => p.Key).Select(p => p.Name).ToList();
+		if (keys.Count == 1)
+			sb.AppendLine($"        builder.HasKey(e => e.{keys[0]});");
+		else if (keys.Count > 1)
+			sb.AppendLine($"        builder.HasKey(e => new {{ {string.Join(", ", keys.Select(k => "e." + k))} }});");
+
+		foreach (var p in entity.Properties)
+		{
+			var chain = new StringBuilder();
+			if (p.Required) chain.Append(".IsRequired()");
+			if (p.MaxLength is int max) chain.Append($".HasMaxLength({max})");
+			if (chain.Length > 0)
+				sb.AppendLine($"        builder.Property(e => e.{p.Name}){chain};");
+		}
+
+		sb.AppendLine("    }");
+		sb.AppendLine("}");
+		return sb.ToString();
+	}
+
+	/// <summary>
+	/// Always emitted (possibly empty) so the user's OnModelCreating compiles even while the
+	/// schema has errors.
+	/// </summary>
+	private static string EmitApplyConfiguration(ContextTarget ctx, List<string> configurations)
+	{
+		var sb = new StringBuilder();
+		sb.AppendLine("// <auto-generated/>");
+		sb.AppendLine("#nullable enable");
+		sb.AppendLine();
+		if (ctx.Namespace is not null) sb.AppendLine($"namespace {ctx.Namespace};").AppendLine();
+
+		sb.AppendLine($"partial class {ctx.Name}");
+		sb.AppendLine("{");
+		sb.AppendLine("    /// <summary>Applies the configuration generated from the entity schema. Call it from OnModelCreating.</summary>");
+		sb.AppendLine("    private static void ApplyGeneratedConfiguration(global::Microsoft.EntityFrameworkCore.ModelBuilder modelBuilder)");
+		sb.AppendLine("    {");
+		foreach (var config in configurations)
+			sb.AppendLine($"        modelBuilder.ApplyConfiguration(new global::{config}());");
+		sb.AppendLine("    }");
+		sb.AppendLine("}");
+		return sb.ToString();
 	}
 
 	private static string EmitDbContext(ContextTarget ctx, List<(string FullName, string SetName)> dbSets)
