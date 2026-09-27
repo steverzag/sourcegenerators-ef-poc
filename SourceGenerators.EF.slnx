@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path=".gitigonre" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Generators/Generators.csproj" Id="f531c1c2-f03c-40de-8ab1-505f056521b0" />
+    <Project Path="src/SourceGenerators.EF/SourceGenerators.EF.csproj" />
+  </Folder>
+</Solution>

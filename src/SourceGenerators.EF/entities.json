@@ -1,0 +1,31 @@
+{
+  "namespace": "SourceGenerators.EF.Entities",
+  "baseType": "SourceGenerators.EF.Entities.Entity",
+  "entities": [
+    {
+      "name": "Customer",
+      "table": "Customers",
+      "properties": [
+        { "name": "Name", "type": "string", "required": true, "maxLength": 100 },
+        { "name": "Email", "type": "string", "nullable": true, "maxLength": 200 }
+      ]
+    },
+    {
+      "name": "Order",
+      "table": "Orders",
+      "properties": [
+        { "name": "CustomerId", "type": "Guid" },
+        { "name": "Total", "type": "decimal" },
+        { "name": "ShippedAt", "type": "DateTime", "nullable": true }
+      ]
+    },
+    {
+      "extends": "SourceGenerators.EF.Entities.Users.User",
+      "properties": [
+        { "name": "PhoneNumber", "type": "string", "nullable": true, "maxLength": 32 },
+        { "name": "LastLoginAt", "type": "DateTimeOffset", "nullable": true },
+        { "name": "IsActive", "type": "bool" }
+      ]
+    }
+  ]
+}
